@@ -269,7 +269,7 @@ if not os.path.exists(seg_control_full_output_dir):
     os.mkdir(seg_control_full_output_dir)
 
 acq_params = []
-train_institutions = ['AH', 'ST']
+train_institutions = ['#', '#']
 for ps_id in unique_ps_ids:
 
     print(ps_id)
