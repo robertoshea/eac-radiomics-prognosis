@@ -1,0 +1,1347 @@
+#alias baseline 02_12_23 (unblinded)
+
+#set seed
+if(T){
+  set.seed(1)
+}
+
+#import libraries
+if(T){
+  library(survival)
+  library(cutpointr)
+  library(ModelMetrics)
+  library(reshape2)
+  library(ggplot2)
+  library(ggpubr)
+  library(survminer)
+  library(scales)
+  library(riskRegression)
+  library(SILGGM)
+  library(abind)
+  library(tidyr)
+}
+
+#utility functions
+if(T){
+  
+  clean_dcm_str <- function(x){
+    x <- gsub(".* \\'", "",  x)
+    x <- gsub(".* \\\"", "",  x)
+    x <- gsub("\\'.*", "",  x)
+    x <- gsub("\\\".*", "",  x)
+    x <- tolower(x)
+    x <- gsub(" ", "_", x)
+    return(x)
+  }
+  
+  fac2 <- function(x, levels=NULL){
+    if(!is.null(levels)){
+      factor(x, exclude=NULL, levels=levels)
+    }else{
+      factor(x, exclude=NULL)
+    }
+  }
+  
+  format_p <- function(x,table=F){
+    x_out <- x
+    x_out[x<0.001]<- "<.001"
+    x_out[0.001<=x&x<0.01]<- round(x[0.001<=x&x<0.01], 3)
+    x_out[0.01<=x&x<0.05]<- round(x[0.01<=x&x<0.05], 2)
+    x_out[0.001<=x&x<0.05] <- paste0("=", substr(x_out[0.001<=x&x<0.05], 2, nchar(x_out[0.001<=x&x<0.05])))
+    x_out[x>=0.05] <- ">.05"
+    if(table){
+      x_out <- gsub("<", "< 0", x_out)
+      x_out <- gsub("=", "0", x_out)
+    }
+    
+    return(x_out)
+  }
+  
+}
+
+#pre-select model features
+if(T){
+  dcm_meta_vars <- c("acq_scanner_manufacturer", "acq_scanner_model", "acq_voxel_dim",
+                     "acq_slice_thickness","acq_kvp","acq_kernel","acq_xr_current","acq_exposure_time","acq_exposure"
+  )
+  clin_features <- c("age", "clin_t_stage", "clin_n_stage")
+  rad_features <- c(
+    "original_shape_VoxelVolume",
+    "original_glcm_Correlation",
+    "original_glcm_Contrast",
+    "original_glcm_Idm"
+  )
+}
+
+#blinding dirs
+if(T){
+  #removed
+}
+
+#data preparation
+if(T){
+  
+  #Clean clinical data
+  if(T){
+    
+    #read in clinical data
+    metadata_file <- file.path(metadata_dir,
+                               "query_standard_cohort_2023-02-22.tsv.txt")
+    metadata <- read.delim(metadata_file, stringsAsFactors = F)
+    
+    #concatenate duplicates
+    metadata_list <- lapply(sort(unique(metadata$occams_id)), function(id_i){
+      
+      metadata_i <- metadata[which(metadata$occams_id==id_i),]
+      return(metadata_i[nrow(metadata_i),])
+    })
+    metadata <- do.call(rbind.data.frame, metadata_list)
+    
+    #identifiers
+    patient_id <- substr(metadata$occams_id, 8, nchar(metadata$occams_id))
+    patient_id <- gsub("/", "", patient_id)
+    sha_id <- metadata$sha_id
+    centre <- substr(patient_id, 1,2)
+    diagnosis_date <- as.Date(metadata$RD_DateOfOGCDiagnosis, format = "%d/%m/%Y")
+    
+    #overall survival
+    os_time <- as.matrix(metadata[,c("deceased_survival_days", "last_known_survival_days")])
+    os_time <- rowSums(os_time, na.rm = TRUE)
+    os_event <- !is.na(metadata$deceased_survival_days)
+    os_censor_date <- diagnosis_date+os_time
+    
+    #demographics
+    age <- metadata$DI_ageAtDiagnosis
+    female <- metadata$DI_PatientGender=="female"
+    smoking <- metadata$EX_IsSmoker
+    smoking[smoking==""]<- "unknown"
+    etoh <- metadata$EX_FormerlyOrCurrentlyHeavyDrinker
+    etoh[etoh==""] <- "unknown"
+    bmi <- metadata$EX_CurrentBMI
+    bmi[bmi==-1]<- NA
+    underweight <- (bmi < 18.5)|is.na(bmi)
+    
+    #clinical T stage
+    clin_t_stage <- metadata$PS_TStage_PrimaryTumour_FinalPretreatmentStaging
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_submucosa")] <- 1
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm")] <- 4
+    clin_t_stage[clin_t_stage %in% c("tumour_invades_adjacent_structures")] <- 4
+    clin_t_stage <- as.numeric(clin_t_stage)
+    clin_t_stage_b <- clin_t_stage >=3
+    
+    #clinical N stage
+    clin_n_stage <- metadata$PS_NStage_PrimaryTumour_FinalPretreatmentStaging_TNM7
+    clin_n_stage <- as.numeric(substr(clin_n_stage, 2, 2))
+    clin_n_stage_b <- clin_n_stage > 0
+    
+    #clinical M stage
+    clin_m_stage <- metadata$PS_MStage_PrimaryTumour_FinalPretreatmentStaging
+    clin_m_stage <- suppressWarnings(as.numeric(substr(clin_m_stage, 2,2)))
+    
+    #overall stage
+    overall_stage <- rep(NA, nrow(metadata))
+    overall_stage[clin_m_stage==1]<- "4b"
+    overall_stage[clin_n_stage==3 &is.na(overall_stage)] <- "4a"
+    overall_stage[clin_n_stage==2 &is.na(overall_stage)] <- "4a"
+    overall_stage[
+      metadata$PS_TStage_PrimaryTumour_FinalPretreatmentStaging==
+        "tumour_invades_adjacent_structures" &is.na(overall_stage)] <- "4a"
+    
+    overall_stage[clin_t_stage>=3&is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage>=3&is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage==2&
+                    clin_n_stage==1
+                  &is.na(overall_stage)] <- "3"
+    overall_stage[clin_t_stage==2
+                  &is.na(overall_stage)] <- "2b"
+    overall_stage[clin_t_stage==1&
+                    clin_n_stage==1&
+                    is.na(overall_stage)] <- "2a"
+    overall_stage[clin_t_stage==1&
+                    is.na(overall_stage)] <- "1"
+    overall_stage <- as.numeric(substr(overall_stage, 1, 1))
+    
+    
+    #recurrence
+    recurrence_event <- grepl("Yes", metadata$hasOriginalDiseaseReoccurred)
+    recurrence_date <- gsub(",.*","",
+                            metadata$dateOriginalDiseaseReoccurred)
+    recurrence_date_type_dmY <- grepl("/", recurrence_date)
+    recurrence_date_type_Ymd <- grepl("-", recurrence_date)
+    recurrence_date_tmp <- as.Date(recurrence_date)
+    recurrence_date_tmp[recurrence_date_type_dmY] <-  as.Date(recurrence_date[recurrence_date_type_dmY],
+                                                              format = "%d/%m/%Y")
+    recurrence_date_tmp[recurrence_date_type_Ymd] <-  as.Date(recurrence_date[recurrence_date_type_Ymd],
+                                                              format = "%Y-%m-%d")
+    recurrence_date <- recurrence_date_tmp
+    recurrence_time <- recurrence_date - diagnosis_date
+    
+    #disease-free survival
+    pfs_event <- recurrence_event|os_event
+    pfs_time <- cbind(os_time, recurrence_time)
+    pfs_time <- apply(pfs_time,1, function(i) min(i, na.rm = T))
+    pfs_censor_date <- diagnosis_date + pfs_time
+    
+    #management
+    metadata$TP_PalliativeAntiCancerTreatmentModality[metadata$TP_PalliativeAntiCancerTreatmentModality=="unknown"] <- ""
+    treatment_modality <- paste0(
+      metadata$TP_CurativeTreatmentModality,
+      metadata$TP_PalliativeAntiCancerTreatmentModality
+    )
+    
+    # surgery
+    underwent_surgery <- metadata$ST_MainSurgery=="yes"
+    
+    #chemotherapy
+    #removed
+    
+    
+    #pathological T stage
+    path_t_stage <- metadata$RP_TStage_PrimaryTumour
+    path_t_stage_missing <- path_t_stage %in% c("not_recorded",
+                                                "")
+    path_t_stage[path_t_stage_missing] <- NA  # absent imputed as t4
+    path_t_stage[path_t_stage %in% c("no_evidence_of_primary_tumour",
+                                     "T0")] <- 0
+    path_t_stage[path_t_stage %in% c("tumour_invades_submucosa",
+                                     "tumour_invades_lamina_propria_or_muscularis_mucosae",
+                                     "tumour_invades_lamina_propria_muscularis_mucosae_or_submucosa",
+                                     "T1",
+                                     "T1a",
+                                     "T1b")] <- 1
+    path_t_stage[path_t_stage %in% c("tumour_invades_muscularis_propria",
+                                     "T2")] <- 2
+    path_t_stage[path_t_stage %in% c("tumour_invades_adventitia",
+                                     "T3")] <- 3
+    path_t_stage[path_t_stage %in% c("tumour_invades_pleura_pericardium_or_diaphragm",
+                                     "tumour_invades_adjacent_structures",
+                                     "tumour_invades_other_adjacent_structures_such_as_aorta_vertebral_body_or_trachea",
+                                     "T4a")] <- 4
+    path_t_stage <- as.numeric(path_t_stage)
+    path_t_stage_b <- path_t_stage >=3
+    
+    #path N stage
+    path_n_stage <- paste0(metadata$RP_Nstage_RP_TNM6,
+                           metadata$RP_Nstage_RP_TNM7)
+    path_n_stage_missing <- path_n_stage==""
+    path_n_stage[path_n_stage_missing] <- NA
+    path_n_stage <- as.numeric(substr(path_n_stage, 2, 2))
+    path_n_stage_b <- path_n_stage > 0
+    
+    #lymphvascular invasion
+    path_invasion <- metadata$RP_LymphoVascularInvasion
+    path_invasion_missing <- path_invasion==""
+    path_invasion[path_invasion_missing] <- NA
+    path_invasion <- (path_invasion=="yes")*1
+    
+    #pathological response
+    path_response <- (path_t_stage < clin_t_stage)*1
+    path_response_missing <- is.na(path_response)
+    
+    #lymphvascular invasion
+    path_invasion <- metadata$RP_LymphoVascularInvasion
+    path_invasion_missing <- path_invasion==""
+    path_invasion[path_invasion_missing] <- NA
+    path_invasion <- (path_invasion=="yes")*1
+    
+    #pathological response
+    path_response <- (path_t_stage < clin_t_stage)*1
+    path_response_missing <- is.na(path_response)
+    
+    #tumour location
+    tumour_location <- metadata$RD_OesophagusSite
+    tumour_location[tumour_location=="lower third"]<- "Oesophagus Lower"
+    tumour_location[tumour_location=="middle third"]<- "Oesophagus Middle"
+    tumour_location[tumour_location=="upper third"]<- "Oesophagus Upper"
+    siewert <-  metadata$RD_SiewertClassification
+    siewert[siewert=="unknown"] <- ""
+    siewert <- paste0("Siewert ", siewert)
+    tumour_location[tumour_location==""]<- siewert[tumour_location==""]
+    tumour_location[tumour_location=="Siewert "]<- "Unknown"
+    combined_tumour_site <- metadata$RD_CombinedTumourSite
+    combined_tumour_site[combined_tumour_site=="GOJ_Siewert:unknown"] <- ""
+    combined_tumour_site[combined_tumour_site==""]<- metadata$RP_PostOpPathCombinedTumourSite[combined_tumour_site==""]
+    combined_tumour_site <- gsub("GOJ_", "", combined_tumour_site)
+    combined_tumour_site <- gsub(":", " ", combined_tumour_site)
+    combined_tumour_site[combined_tumour_site=="Oesophagus lower third"] <- "Oesophagus Lower"
+    combined_tumour_site[combined_tumour_site=="Oesophagus middle third"] <- "Oesophagus Middle"
+    combined_tumour_site[combined_tumour_site=="Oesophagus upper third"] <- "Oesophagus Upper"
+    combined_tumour_site[combined_tumour_site=="Siewert unknown"] <- "Unknown"
+    tumour_location[combined_tumour_site!=""] <- combined_tumour_site[combined_tumour_site!=""]
+    metadata$RD_Stomach[metadata$RD_Stomach==""] <- "Unknown"
+    metadata$RD_Stomach[metadata$RD_Stomach=="cardia"] <- "Siewert 2"
+    metadata$RD_Stomach[metadata$RD_Stomach=="fundus"] <- "Siewert 3"
+    metadata$RD_Stomach[metadata$RD_Stomach=="antrum"] <- "Siewert 3"
+    tumour_location[tumour_location=="Unknown"] <-
+      metadata$RD_Stomach[tumour_location=="Unknown"]
+    ps_siewert <- metadata$PS_SiewertClassification
+    ps_siewert[ps_siewert%in%c("", "unknown")]<- "Unknown"
+    ps_siewert[ps_siewert!="Unknown"] <-
+      paste0("Siewert ",
+             ps_siewert[ps_siewert!="Unknown"])
+    tumour_location[tumour_location=="Unknown"] <- ps_siewert[tumour_location=="Unknown"]
+    
+    clinical_data <- data.frame(
+      pathology="oesophageal adenocarcinoma",
+      patient_id,
+      sha_id,
+      centre,
+      diagnosis_date,
+      age,
+      female,
+      bmi,
+      underweight,
+      smoking,
+      etoh,
+      underwent_surgery,
+      clin_t_stage,
+      clin_t_stage_b,
+      clin_n_stage,
+      clin_n_stage_b,
+      clin_m_stage,
+      overall_stage,
+      os_censor_date,
+      os_event,
+      pfs_censor_date,
+      pfs_event,
+      treatment_modality,
+      chemotherapy_protocol,
+      path_t_stage,
+      path_t_stage_b,
+      path_n_stage,
+      path_n_stage_b,
+      path_invasion,
+      path_response,
+      tumour_location,
+      stringsAsFactors = F
+    )
+    
+    initial_patient_count <- length(unique(patient_id))
+    initial_centre_counts <- table(centre)
+    
+    
+  }
+  
+  #import ct image acquisition parameters
+  if(T){
+    acq_params_df <- read.csv(acq_params_file)[,-1]
+    acq_params_df <- acq_params_df[,!colnames(acq_params_df)=="slice_thickness"]
+    acq_params_df$acq_study_date <- paste0(
+      substr(acq_params_df$acq_study_date,
+             1,4),'-',
+      substr(acq_params_df$acq_study_date,
+             5,6),'-',
+      substr(acq_params_df$acq_study_date,
+             7,8)
+    )
+    acq_params_df$acq_study_date <- as.Date(acq_params_df$acq_study_date, format="%Y-%m-%d")
+    truncation_df <- read.csv(truncation_file)[,-1]
+    acq_params_df <- merge.data.frame(acq_params_df, truncation_df, all.x = T, all.y = T)
+    acq_params_df$truncation[is.na(acq_params_df$truncation)] <- F
+    acq_params_df$dataset <- "ALIAS"
+    acq_params_df <- acq_params_df[acq_params_df$scan=="SCAN1",]
+    
+    clinical_data <- merge.data.frame(clinical_data, acq_params_df, by='patient_id', all.x = T, all.y = T)
+    
+    patients_without_scan1 <- setdiff(clinical_data$patient_id, acq_params_df$patient_id)
+    
+    clinical_data$os_time <- as.numeric(clinical_data$os_censor_date - clinical_data$acq_study_date)
+    clinical_data$pfs_time <-  as.numeric(clinical_data$pfs_censor_date - clinical_data$acq_study_date)
+    
+    
+  }
+  
+  #import radiomic data
+  if(T){
+    
+    radiomic_df <- read.csv(radiomic_df_file)[,-1]
+    radiomic_df <- radiomic_df[radiomic_df$region=="gtv"&
+                                 radiomic_df$scan=="SCAN1",]
+    
+    patients_with_corrupt_scan <- setdiff(acq_params_df$patient_id, radiomic_df$patient_id)
+    radiomic_df <- merge.data.frame(x=radiomic_df, y=acq_params_df, by=c("patient_id", "scan", "dataset"), all.x = T, all.y = F)
+    
+    patient_without_visible_tumour <- unique(radiomic_df$patient_id[
+      radiomic_df$region_identified=="False"
+    ])
+    
+    radiomic_df <- radiomic_df[radiomic_df$region_identified=="True",]
+    
+    patients_with_truncation <- unique(radiomic_df$patient_id[radiomic_df$truncation=="True"])
+    radiomic_df <- radiomic_df[radiomic_df$truncation=='False',]
+    
+    n_patients_without_scan1 <- length(patients_without_scan1)
+    n_patients_with_corrupt_scan <- length(patients_with_corrupt_scan)
+    n_patient_without_visible_tumour <- length(patient_without_visible_tumour)
+    n_patients_with_truncation <- length(patients_with_truncation)
+    
+    #extract control radiomics
+    stability_df <- radiomic_df[,c("patient_id", "region", dcm_meta_vars, rad_features)]
+    stability_df$institution <- substr(stability_df$patient_id,1,2)
+    
+    
+  }
+  
+  #merge clinical data, acquisition parameters and radiomic data
+  if(T){
+    
+    radioclinical_df <- merge.data.frame(clinical_data, radiomic_df, all.x = F, all.y = T)
+    
+    #remove palliatively managed patients
+    palliative_patients <- radioclinical_df$patient_id[
+      radioclinical_df$treatment_modality=="palliative oncological treatment"]
+    n_palliative_patients <- length(palliative_patients)
+    radioclinical_df <- radioclinical_df[
+      radioclinical_df$treatment_modality!="palliative oncological treatment",]
+    
+  }
+  
+  #output integrated dataset
+  if(T){
+    alias_df <- radioclinical_df
+    alias_df$dataset <- "eac"
+  }
+  
+  #write.csv(alias_df, scan1_radioclinical_df_output_file)
+  
+}
+
+#merge datasets
+if(T){
+  all_data <- alias_df
+}
+
+#preprocessing
+if(T){
+  comparison_time <- 1095
+  all_data$female <- as.numeric(all_data$female)
+  all_data$os_3yr <- all_data$os_time >= comparison_time
+  all_data$pfs_3yr <- all_data$pfs_time >= comparison_time
+  
+  all_data$original_shape_VoxelVolume <- log(all_data$original_shape_VoxelVolume)
+}
+
+#partition data
+if(T){
+  train_centres <- c("#", "#", "#")
+  train_idx <- all_data$centre %in% train_centres
+  test_idx <- !train_idx
+  df_list <- list()
+  
+  df_list$train_eac <- all_data[train_idx, ]
+  df_list$test_eac <- all_data[test_idx, ]
+}
+
+#data characteristics 2
+if(T){
+  
+  age_test <- t.test(df_list$train_eac$age,
+                     df_list$test_eac$age
+  )
+  
+  train_test_fac <- factor(ifelse(train_idx, "Train", "Test"),
+                           levels=c("Train", "Test"))
+  cat_vars <- list(
+    Sex = factor(ifelse(all_data$female, "Female", "Male")),
+    cT_stage =factor(all_data$clin_t_stage),
+    cN_stage =factor(all_data$clin_n_stage),
+    Tumour_Location=factor(all_data$tumour_location, levels=c(
+      "Oesophagus Middle", "Oesophagus Lower", "Siewert 1",
+      "Siewert 2", "Siewert 3"
+    )),
+    Treatment = factor(all_data$treatment_modality),
+    OS_3yr = factor(ifelse(all_data$os_time >= 1095, "Survived", "Deceased")),
+    Censor = factor(ifelse(all_data$os_event, "Observed", "Censored"))
+  )
+  cat_tbls <- lapply(cat_vars, function(x){
+    table(x,train_test_fac)
+  })
+  cat_tests <- lapply(cat_tbls, function(x){
+    test_i <- suppressWarnings(chisq.test(x))
+    test_i <- data.frame(
+      chisq=test_i$statistic,
+      df=test_i$parameter,
+      p_value=test_i$p.value)
+    return(test_i)
+  })
+  sex <- factor(ifelse(all_data$female, "Female", "Male"))
+  train_test <- factor(ifelse(train_idx, "Train", "Test"))
+  sex_tbl <- table(data.frame(sex, train_test))
+  sex_test <- chisq.test(sex_tbl)
+  cT_stage_tbl <- table(data.frame(factor(all_data$clin_t_stage),
+                                   train_test))
+  cT_stage_test <- suppressWarnings(chisq.test(cT_stage_tbl))
+  cN_stage_tbl <- table(data.frame(factor(all_data$clin_n_stage),
+                                   train_test))
+  cN_stage_test <- suppressWarnings(chisq.test(cN_stage_tbl))
+  
+  
+  
+}
+
+#data characteristics 3
+if(T){
+  all_data <- all_data[all_data$patient_id %in% c(df_list$Train$patient_id, df_list$Test$patient_id),]
+  all_data$partition <- factor(ifelse(all_data$centre %in% train_centres, "Train", "Test"),
+                               levels=c("Train", "Test"))
+  
+  #clinical characteristics
+  #all_data$Age_fac <- cut(all_data$age, c(45, 60, 75, 90))
+  all_data$Sex_fac <- factor(ifelse(all_data$female, "female", "male"))
+  all_data$BMI_fac <- as.character(cut(all_data$bmi, c(0, 18.5, 25, 30, 45)))
+  all_data$BMI_fac[is.na(all_data$BMI_fac)] <- "unknown"
+  all_data$BMI_fac <- factor(all_data$BMI_fac)
+  all_data$Smoking_fac <- fac2(all_data$smoking)
+  all_data$Chemotherapy_fac <- fac2(all_data$chemotherapy_protocol)
+  all_data$cT_stage_fac <- all_data$clin_t_stage
+  all_data$cT_stage_fac[is.na(all_data$cT_stage_fac)]<- "unknown"
+  all_data$cT_stage_fac <- fac2(all_data$cT_stage_fac)
+  all_data$cN_stage_fac <- all_data$clin_n_stage
+  all_data$cN_stage_fac[is.na(all_data$cN_stage_fac)]<- "unknown"
+  all_data$cN_stage_fac <- fac2(all_data$cN_stage_fac)
+  all_data$Tumour_Location_fac <-  fac2(all_data$tumour_location,
+                                        levels = c("Oesophagus Middle", "Oesophagus Lower","Siewert 1",
+                                                   "Siewert 2", "Siewert 3"
+                                        ))
+  
+  all_data$Tumour_Volume_fac <- all_data$original_shape_VoxelVolume/1000
+  all_data$Tumour_Volume_fac <- cut(all_data$Tumour_Volume_fac, breaks=c(0, 5, 25, 75, 125, 150))
+  all_data$Treatment_Modality_fac <- factor(c(
+    "CRS", "CR", "S"
+  )[factor(all_data$treatment_modality)])
+  all_data$Tumour_Volume_fac <- exp(all_data$original_shape_VoxelVolume)
+  all_data$Tumour_Volume_fac <- cut(all_data$Tumour_Volume_fac, breaks=c(0, 5, 25, 75, 125, 150))
+  all_data$RECIST_fac <- 
+    factor(
+      c("CR", "PR", "SD", "PD")[
+        cut(all_data$vol_delta, breaks=c(-2,-0.999, -0.3, 0.2, 2))
+      ],
+      levels=c("CR", "PR", "SD", "PD")
+    )
+  all_data$SVR_fac <- exp(all_data$original_shape_SurfaceVolumeRatio)
+  all_data$SVR_fac <- cut(all_data$SVR_fac, breaks=c(0, 0.25, 0.5, 0.75, 1))
+  
+  #image characteristics
+  all_data$acq_Scanner_Manufacturer_fac <- fac2(all_data$acq_scanner_manufacturer)
+  all_data$acq_kernel[all_data$kernel%in%c("2", "3", "b", "c")]<- "other"
+  all_data$acq_kernel[!all_data$acq_kernel %in% names(sort(-table(all_data$acq_kernel)))[1:5]]<- "other"
+  all_data$acq_Kernel_fac <- fac2(all_data$acq_kernel)
+  all_data$acq_XR_Current_fac <- as.character(cut(as.numeric(all_data$acq_xr_current),
+                                                  breaks=c(0, 200, 500, 1000), dig.lab = 5))
+  all_data$acq_XR_Current_fac[is.na(all_data$acq_XR_Current_fac)] <- "unknown"
+  all_data$acq_XR_Current_fac <- fac2(all_data$acq_XR_Current_fac)
+  all_data$acq_kVp_fac <- fac2(as.numeric(all_data$acq_kvp))
+  all_data$acq_Exposure_Time_fac <- as.numeric(all_data$acq_exposure_time)
+  all_data$acq_Exposure_Time_fac <- as.character(cut(all_data$acq_Exposure_Time_fac,
+                                                     breaks=c(0, 400, 800, 1200), dig.lab = 5))
+  all_data$acq_Exposure_Time_fac[is.na(all_data$acq_Exposure_Time_fac)]<- "unknown"
+  all_data$acq_Exposure_Time_fac <- fac2(all_data$acq_Exposure_Time_fac)
+  all_data$acq_Exposure_fac <- as.character(cut(as.numeric(all_data$acq_exposure),
+                                                breaks=c(0, 100, 200, 300, Inf), dig.lab = 5))
+  all_data$acq_Exposure_fac[is.na(all_data$acq_Exposure_fac)] <- "unknown"
+  all_data$acq_Exposure_fac <- fac2(all_data$acq_Exposure_fac)
+  all_data$acq_Voxel_Width_fac <- as.character(cut(as.numeric(all_data$acq_voxel_dim),
+                                                   breaks=c(0.5, 0.7, 0.9, 1), dig.lab = 5))
+  all_data$acq_Voxel_Width_fac[is.na(all_data$acq_Voxel_Width_fac)] <- "unknown"
+  all_data$acq_Voxel_Width_fac <- factor(all_data$acq_Voxel_Width_fac)
+  
+  extract_summaries <- function(all_data, table_type="participant"){
+    
+    summary_vars <- grep("_fac$", colnames(all_data), value=T)
+    if(table_type=="acq"){
+      summary_vars <- summary_vars[grepl("^acq_", summary_vars)]
+    }else{
+      all_data <- all_data[!duplicated(all_data$patient_id),]
+      summary_vars <- summary_vars[!grepl("^acq_", summary_vars)]
+    }
+    summary_list <- lapply(summary_vars, function(summary_var_i){
+      
+      tbl_i <- table(as.data.frame(all_data[,c( summary_var_i, "partition")]))
+      if("unavailable" %in% rownames(tbl_i)){
+        tbl_i <- tbl_i[c(which(rownames(tbl_i)!="unavailable"),
+                         which(rownames(tbl_i)=="unavailable")),]
+      }
+      test_i <- fisher.test(tbl_i)
+      tbl_i[] <- paste0(tbl_i, " (", 100*round(t(t(tbl_i)/colSums(tbl_i)), 2), ")")
+      tbl_i <- cbind(rownames(tbl_i), tbl_i)
+      mat_i <- matrix("", nrow(tbl_i)+1, 5)
+      mat_i[-1,2:4]<- tbl_i
+      mat_i[1]<- gsub("_fac", "", summary_var_i)
+      mat_i[nrow(mat_i),5]<- round(test_i$p.value, 5)
+      return(mat_i)
+    })
+    summary_list <- do.call(rbind, summary_list)
+    colnames(summary_list)<- c("Variable", "Value", "Train", "Validation", "P-value")
+    return(summary_list)
+    
+  }
+  participant_summaries <- extract_summaries(all_data)
+  age_train_mean <- round(mean(all_data$age[all_data$partition=="Train"]))
+  age_train_sd <- round(sd(all_data$age[all_data$partition=="Train"]))
+  age_test_mean <- round(mean(all_data$age[all_data$partition=="Test"]))
+  age_test_sd <- round(sd(all_data$age[all_data$partition=="Test"]))
+  age_pval <- round(t.test(all_data$age[all_data$partition=="Train"], all_data$age[all_data$partition=="Test"])$p.value, 2)
+  
+  age_summary <- c("Age", "Years",
+                   paste0(age_train_mean, "+/-", age_train_sd),
+                   paste0(age_test_mean, "+/-", age_test_sd),
+                   age_pval)
+  names(age_summary) <- colnames(participant_summaries)
+  participant_summaries <- rbind(age_summary, participant_summaries)
+  
+  write.csv(participant_summaries,
+            "tables/participant_summaries.csv",
+            row.names = F)
+  
+  image_parameter_summaries <- extract_summaries(all_data, table_type="acq")
+  write.csv(image_parameter_summaries,
+            "tables/image_parameter_summaries.csv",
+            row.names = F)
+}
+
+#modelling
+if(T){
+  
+  #feature preselection
+  rad_feature_cors <- cor(df_list$train_eac[rad_features])
+  most_correlated_feature <- names(which.max(diag(solve(rad_feature_cors))[-1]))
+  rad_features <- setdiff(rad_features, most_correlated_feature)
+  
+  
+  df_list$train_eac$os_3yr_neg <- 1-df_list$train_eac$os_3yr
+  df_list$test_eac$os_3yr_neg <- 1-df_list$test_eac$os_3yr
+  y_outcome <- 'os_3yr_neg'
+  
+  features_list <- list(
+    clin=clin_features,
+    clinv=c(clin_features, rad_features[1]),
+    clinrad=c(clin_features, rad_features),
+    tnm="overall_stage"
+  )
+  
+  formula_list <- lapply(features_list, function(features_i){
+    as.formula(
+      paste0(y_outcome, "~",paste(features_i, collapse = "+"))
+    )
+  })
+  mod_list <- lapply(formula_list, function(formula_i){
+    eval(bquote(
+      glm(.(formula_i),
+          data =  df_list$train_eac,
+          family='binomial',
+          x=T)
+    ))
+  })
+  
+  all_coefs <- unique(unlist(features_list))
+  coefs_df <- data.frame(matrix(ncol = length(all_coefs), nrow = 0))
+  colnames(coefs_df) <- all_coefs
+  for(i in seq_along(mod_list)){
+    mod_i <- mod_list[[i]]
+    coefs_df[i,names(coef(mod_i))] <- coef(mod_i)
+  }
+  coefs_df[is.na(coefs_df)]<- 0
+  
+  rownames(coefs_df) <- names(mod_list)
+  coefs_df <- t(coefs_df)
+  coefs_df <- formatC(coefs_df, digits=4)
+  #write.csv(coefs_df, file="tables/coefs_df.csv")
+  
+  #cutpoint analysis
+  param_grid <- expand.grid(
+    model_type=c(names(mod_list)),
+    stringsAsFactors = F
+  )
+  cutpoint_analysis <- function(model_type){
+    
+    df_i <- df_list$train_eac
+    mod <- mod_list[[model_type]]
+    
+    df_i$y <- (df_i$os_time < comparison_time)*1
+    df_i$yhat <- predict(mod, df_i)
+    cutpoint_i <- cutpointr(data=df_i,
+                            x=yhat,
+                            class=y,
+                            pos_class=1,
+                            direction=">=",
+                            use_midpoints=TRUE,
+                            metric=spec_constrain,
+                            min_constrain = 0.90,
+                            method = maximize_metric,
+                            silent=T
+    )$optimal_cutpoint
+    output <- data.frame(
+      model_type=model_type,
+      cutpoint=cutpoint_i
+    )
+    return(output)
+  }
+  cutpoint_df <- lapply(1:nrow(param_grid), function(params_i){
+    cutpoint_analysis(
+      model_type = param_grid$model_type[params_i]
+    )
+  })
+  cutpoint_df <- do.call(rbind,
+                         cutpoint_df)
+  
+  
+}
+
+#evaluate performance
+if(T){
+  
+  set.seed(1)
+  
+  roundf <- function(x, d=2){
+    format(round(x,d),nsmall=d)
+  }
+  
+  agg_vars <- c( "model_type", "dataset")
+  agg_func <- function(x){
+    mu <- roundf(mean(x))
+    ci <- roundf(quantile(x, probs=c(0.025, 0.975)))
+    out <- paste0(mu, " [",ci[1], ", ",ci[2],"]")
+    return(out)
+  }
+  
+  #overall performance analysis
+  rr_list <- lapply(c('train_eac', 'test_eac'), function(dataset_i){
+    
+    test_i <- riskRegression::Score(
+      mod_list,
+      formula = Surv(os_time, os_event) ~ 1,
+      data = df_list[[dataset_i]],
+      conf.int = T,
+      time=comparison_time)
+    
+    auc_scores_i <- test_i$AUC$score[,c("model", "AUC", "lower", "upper")]
+    colnames(auc_scores_i)<- c("model_type", "estimate", "ci_lo", "ci_hi")
+    auc_scores_i$metric <- "AUC"
+    brier_scores_i <- test_i$Brier$score[,c("model", "Brier", "lower", "upper")]
+    colnames(brier_scores_i)<- c("model_type", "estimate", "ci_lo", "ci_hi")
+    brier_scores_i$metric <- "Brier"
+    scores_i <- rbind.data.frame(auc_scores_i, brier_scores_i)
+    scores_i$dataset <- dataset_i
+    
+    comparison_i <- test_i$AUC$contrasts[,c("model","reference","delta.AUC", "lower", "upper", "p")]
+    colnames(comparison_i)<- c("model","reference_model", "delta_auc", "delta_auc_lo", "delta_auc_hi", "p")
+    comparison_i$dataset <- dataset_i
+    output_i <- list(
+      scores=scores_i,
+      comparison=comparison_i
+    )
+    return(output_i)
+  })
+  scores_df <- do.call(rbind.data.frame,
+                       lapply(rr_list, "[[", "scores"))
+  scores_df[,c("estimate", "ci_lo", "ci_hi")] <- round(scores_df[,c("estimate", "ci_lo", "ci_hi")], 3)
+  
+  scores_df$score_text <- paste0(roundf(scores_df$estimate), " [",
+                                 roundf(scores_df$ci_lo), ", ",
+                                 roundf(scores_df$ci_hi), "]"
+  )
+  auc_df = scores_df[scores_df$metric=="AUC",c("model_type", "dataset", "score_text")]
+  colnames(auc_df)[3]<- "AUC"
+  brier_df = scores_df[scores_df$metric=="Brier",c("model_type", "dataset", "score_text")]
+  colnames(brier_df)[3]<- "Brier"
+  brier_df = brier_df[brier_df$model_type!="Null model",]
+  scores_table <- auc_df
+  scores_table$Brier <- brier_df$Brier
+  scores_table$dataset <- factor(scores_table$dataset, levels=c("train_eac", "test_eac"))
+  scores_table <- scores_table[,c(2,1, 3,4)]
+  
+  
+  comparison_df <- rr_list[[2]]$comparison[1:2,]
+  comparison_df[,3:6] <- round(comparison_df[,3:6], 2)
+  write.csv(comparison_df, "tables/comparison_df.csv")
+  
+  
+  #high sensitivity classification performance
+  param_grid <- expand.grid(
+    dataset=c("train_eac", "test_eac"),
+    model_type=names(mod_list),
+    rep=1:1000
+  )
+  set.seed(0)
+  class_performance <- lapply(1:nrow(param_grid), function(params_i){
+    
+    dataset=param_grid$dataset[params_i]
+    model_type=param_grid$model_type[params_i]
+    
+    # assign model type
+    mod=mod_list[[model_type]]
+    
+    #assign cutpoint
+    cutpoint_i <- cutpoint_df$cutpoint[cutpoint_df$model_type==model_type]
+    
+    # assign data
+    df_i <- df_list[[dataset]]
+    df_i$yhat <- predict(mod, newdata=df_i)
+    df_i$yhat_3yr <- df_i$yhat>cutpoint_i
+    
+    df_i$y_time <- df_i$os_time
+    df_i$y_event <- df_i$os_event
+    df_i$y_3yr <- df_i$os_time < comparison_time
+    df_i <- df_i[sample(nrow(df_i), replace=T),]
+    
+    cm <- caret::confusionMatrix(data=factor(df_i$yhat_3yr),
+                                 reference=factor(df_i$y_3yr),
+                                 positive="TRUE")
+    class_metrics <- cm$byClass
+    output_i <- as.data.frame(t(as.matrix(class_metrics)))
+    output_i$accuracy <- cm$overall["Accuracy"]
+    output_i$model_type=model_type
+    output_i$dataset=dataset
+    colnames(output_i)<- tolower(colnames(output_i))
+    
+    return(output_i)
+    
+  })
+  class_performance <- do.call(rbind.data.frame,class_performance)
+  class_performance <- cbind(class_performance[,c("model_type", "dataset")],
+                             class_performance[,c("sensitivity", "specificity", "accuracy")])
+  metric_cols <- c("sensitivity", "specificity", "accuracy")
+  high_sensitivity_table <-   aggregate(class_performance[metric_cols],
+                                        by=class_performance[agg_vars],
+                                        FUN=agg_func)
+  colnames(high_sensitivity_table)[3:5] <- c("Sensitivity", "Specificity", "Accuracy")
+  
+  high_sensitivity_table$dataset <- factor(high_sensitivity_table$dataset, levels=c("train_eac", "test_eac")) 
+  high_sensitivity_table <- high_sensitivity_table[,c(2,1,3,4,5)]
+  
+  all_performance_table <- merge.data.frame(scores_table, high_sensitivity_table, sort = F)
+  colnames(all_performance_table)[1:2] <- c("Dataset", "Model")
+  all_performance_table$Dataset <- c("Train","Test")[factor(all_performance_table$Dataset, levels=c("train_eac", "test_eac"))]
+  all_performance_table$Model <- c("Clinical", "ClinVol", "ClinRad")[factor(all_performance_table$Model)]
+  write.table(all_performance_table, file="tables/all_performance_table.tsv", sep="\t", row.names = F)
+  
+  #mod_coefficients
+  coefs_list <- lapply(seq_along(mod_list), function(i){
+    mod_i <- mod_list[[i]]
+    coefs_i <- as.data.frame(summary(mod_i)$coefficients)[,c(1,2,4)]
+    coefs_i$model <- c("Clinical", "ClinVol", "ClinRad")[i]
+    coefs_i$variable <- rownames(coefs_i)
+    rownames(coefs_i) <- NULL
+    return(coefs_i)
+  })
+  coefs_df <- do.call(rbind,coefs_list)
+  
+  colnames(coefs_df) <- c("beta", "sigma", "p_val", "model", "variable")
+  coefs_df <- coefs_df[,c("model", "variable", "beta", "sigma", "p_val")]
+  coefs_df$variable <- gsub("^original_shape_VoxelVolume", "Volume (log cm^3)", coefs_df$variable)
+  coefs_df$variable <- gsub("^age", "Age", coefs_df$variable)
+  coefs_df$variable <- gsub("clin_t_stage", "cT-Stage", coefs_df$variable)
+  coefs_df$variable <- gsub("clin_n_stage", "cN-Stage", coefs_df$variable)
+  coefs_df$variable <- gsub("original_glcm_Correlation", "GLCM_Correlation", coefs_df$variable)
+  coefs_df$variable <- gsub("original_glcm_Constrast", "GLCM_Contrast", coefs_df$variable)
+  coefs_df$beta <- round(coefs_df$beta, 5)
+  coefs_df$sigma <- round(coefs_df$sigma, 3)
+  coefs_df$p_val <- round(coefs_df$p_val, 4)
+  write.csv(coefs_df, "tables/coefs_df.csv")
+  
+  coefs_df2 <- coefs_df
+  coefs_df2 <- coefs_df2[coefs_df2$variable!="(Intercept)",]
+  coefs_df2$ci_hi <- coefs_df2$beta+2*coefs_df2$sigma
+  coefs_df2$ci_lo <- coefs_df2$beta-2*coefs_df2$sigma
+  colnames(coefs_df2)[1] <- c("Model")
+  
+  
+}
+
+#plotting
+if(T){
+  
+  #data characteristics
+  characteristics_plot_df <- all_data[,c("Institution_fac", "Age_fac", "cT_stage_fac", "cN_stage_fac", "Tumour_Volume_fac",
+                                         "Treatment_Modality_fac",
+                                         "acq_Scanner_Manufacturer_fac",
+                                         "OS_Time_fac", "OS_Event_fac"
+  )]
+  characteristics_plot_df$Dataset <- ""
+  characteristics_plot_df$Dataset[all_data$centre%in%train_centres]<- "Train"
+  characteristics_plot_df$Dataset[characteristics_plot_df$Dataset==""]<- "Test"
+  characteristics_plot_df$Dataset <- factor(characteristics_plot_df$Dataset, levels=c("Train", "Test"))
+  
+  characteristics_plot_df <- characteristics_plot_df[,-1]
+  
+  colnames(characteristics_plot_df)[1:8] <- c("Age", "T_Stage", "N_Stage", "Tumour_volume",
+                                              "Treatment_Modality", "Scanner", "OS_time", "OS_event")
+  characteristics_plot_df$Scanner <- c("GE", "Philips", "Siemens", "Toshiba")[characteristics_plot_df$Scanner]
+  characteristics_plot_df$T_Stage <- factor(paste0("T", as.character(characteristics_plot_df$T_Stage)))
+  characteristics_plot_df$N_Stage <- factor(paste0("N", as.character(characteristics_plot_df$N_Stage)))
+  
+  xlab_list <- list(
+    Age="Years",
+    T_Stage=element_blank(),
+    N_stage=element_blank(),
+    Tumour_Volume="ml",
+    Scanner=element_blank(),
+    Treatment_Pathway=element_blank(),
+    OS_Time="Years",
+    OS_Event=element_blank()
+  )
+  characteristics_plot_list <- lapply(1:8, function(plot_i){
+    var_i <- colnames(characteristics_plot_df)[plot_i]
+    tbl_i <- table(characteristics_plot_df[,c("Dataset", var_i)])
+    tbl_i <- melt(tbl_i)
+    colnames(tbl_i)[2]<- var_i
+    title_i <- gsub("_", " ", var_i)
+    title_i <- gsub("T Stage", "cT stage",title_i)
+    title_i <- gsub("N Stage", "cN stage",title_i)
+    xlab_i <- xlab_list[[var_i]]
+    tbl_plot_i <- ggplot(tbl_i, aes_string(fill="Dataset", x=var_i, y="value"))+
+      geom_bar(stat = "identity", width=0.5,position=position_dodge(width = 0.6))+
+      coord_flip()+
+      ggtitle(title_i)+
+      ylab("N")+
+      theme(axis.title.y=element_text(size=rel(0.8)))+
+      xlab(xlab_i)
+    
+    return(tbl_plot_i)
+  })
+  characteristics_plots <- ggarrange(plotlist = characteristics_plot_list,
+                                     common.legend = T,
+                                     nrow = 2,
+                                     ncol= 4,
+                                     legend="bottom")
+  ggsave(characteristics_plots,
+         filename = "figures/characteristics_plots.png",
+         width=10,
+         height=6,
+         dpi=600,
+         units = "in")
+  
+  
+  #KM plots
+  km_list <- lapply(names(mod_list), function(model_type){
+    
+    mod_i <- mod_list[[model_type]]
+    yhat_train <- predict(mod_i, newdata = df_list$train_eac)
+    yhat_test <- predict(mod_i, newdata = df_list$test_eac)
+    
+    cutoff_i <- cutpoint_df$cutpoint[cutpoint_df$model_type==model_type]
+    grp_train <- ifelse(yhat_train>=cutoff_i,#median(yhat_train),
+                        "High Risk", "Low Risk")
+    grp_test <- ifelse(yhat_test>=cutoff_i,#median(yhat_test),
+                       "High Risk", "Low Risk")
+    km_df_i <- data.frame(
+      model=model_type,
+      yhat=c(yhat_train, yhat_test),
+      grp=c(grp_train, grp_test),
+      dataset=rep(c("Train", "Test"), times=c(nrow(df_list$train_eac),
+                                              nrow(df_list$test_eac))),
+      os_time=c(df_list$train_eac$os_time,
+                df_list$test_eac$os_time),
+      os_event=c(df_list$train_eac$os_event,
+                 df_list$test_eac$os_event)
+    )
+    
+    return(km_df_i)
+  })
+  km_df <- do.call(rbind, km_list)
+  km_df$y_true <- Surv(km_df$os_time, km_df$os_event)
+  km_df$model <- factor(km_df$model, levels = names(mod_list))
+  km_df$model <- factor(c("Clinical", "ClinVol", "ClinRad")[km_df$model],
+                        levels = c("Clinical", "ClinVol", "ClinRad")
+  )
+  km_plotlist <- lapply(c("Train", "Test"), function(dataset_i){
+    
+    df_i <- km_df[km_df$dataset==dataset_i,]
+    km_plot_i <- ggsurvplot_facet(
+      survfit(y_true~grp, data=df_i),
+      facet.by = c("model"),
+      conf.int = TRUE,
+      #pval = TRUE,              
+      #risk.table = TRUE,        
+      risk.table.col = "strata",
+      data = df_i,
+      legend="right",
+      legend.title = element_blank(),
+      legend.position="right",
+      legend.labs = c("High Risk", "Low Risk"),
+      ggtheme = theme_bw(),
+      xlab="Time (days)",
+      break.time.by=1000,
+      title=dataset_i,
+      short.panel.labs=T
+    )
+    return(km_plot_i)
+  })
+  km_plots <- ggarrange(plotlist=km_plotlist,
+                        nrow = 2,
+                        common.legend = T,
+                        legend = "bottom")
+  
+  ggsave(km_plots,
+         filename = "figures/km_plots_23_11_23.png",
+         width=8,
+         height=7,
+         dpi=600,
+         units = "in")
+  
+  #surv stats
+  km_list <- lapply(names(mod_list), function(model_type){
+    
+    mod_i <- mod_list[[model_type]]
+    yhat_train <- predict(mod_i, newdata = df_list$train_eac)
+    yhat_test <- predict(mod_i, newdata = df_list$test_eac)
+    
+    cutoff_i <- cutpoint_df$cutpoint[cutpoint_df$model_type==model_type]
+    grp_train <- ifelse(yhat_train>=cutoff_i,#median(yhat_train),
+                        "High Risk", "Low Risk")
+    grp_test <- ifelse(yhat_test>=cutoff_i,#median(yhat_test),
+                       "High Risk", "Low Risk")
+    km_df_i <- data.frame(
+      model=model_type,
+      yhat=c(yhat_train, yhat_test),
+      grp=c(grp_train, grp_test),
+      dataset=rep(c("Train", "Test"), times=c(nrow(df_list$train_eac),
+                                              nrow(df_list$test_eac))),
+      os_time=c(df_list$train_eac$os_time,
+                df_list$test_eac$os_time),
+      os_event=c(df_list$train_eac$os_event,
+                 df_list$test_eac$os_event)
+    )
+    
+    return(km_df_i)
+  })
+  km_df <- do.call(rbind, km_list)
+  km_df$y_true <- Surv(km_df$os_time, km_df$os_event)
+  km_df$model <- factor(km_df$model, levels = names(mod_list))
+  km_params <- expand.grid(
+    dataset=unique(km_df$dataset),
+    model=unique(km_df$model),
+    stringsAsFactors = F
+  )
+  surv_summaries <- lapply(1:nrow(km_params), function(i){
+    df_i <- km_df[(km_df$dataset==km_params$dataset[i])&(km_params$model==km_params$model[i]),]
+    
+    bs_mean_survival_time <- sapply(1:500, function(i){
+      bs_idx <- sample(nrow(df_i), replace = T)
+      fit_bs_i <- survfit(Surv(os_time, os_event) ~ grp,
+                          data = df_i[bs_idx,])
+      mu_i <- summary(fit_bs_i)$table[,"rmean"]
+      return(mu_i)
+    })
+    surv_ci <- apply(bs_mean_survival_time, 1, function(x) quantile(x, probs=c(0.025, 0.975)))
+    
+    fit <- survfit(Surv(os_time, os_event) ~ grp, data = df_i)
+    out_i <- as.data.frame(summary(fit)$table)
+    
+    
+    out_i$dataset <- km_params$dataset[i]
+    out_i$model <- km_params$model[i]
+    out_i$group <- substr(rownames(out_i), 5, nchar(rownames(out_i)))
+    return(out_i)
+  })
+  surv_summaries <- do.call(rbind, surv_summaries)
+  surv_summaries <- surv_summaries[,-c(2,3,6)]
+  surv_summaries$mean <- paste0(round(surv_summaries$rmean), " [", 
+                                surv_summaries[,5], ", ",
+                                surv_summaries[,6],"]"
+  )
+  surv_summaries <- surv_summaries[,c(7:9, 1:2, 4, 10)]
+  rownames(surv_summaries) <- NULL
+  surv_summaries$model <- c("Clinical", "ClinVol", "ClinRad", "TNM")[surv_summaries$model]
+  colnames(surv_summaries) <- c("Dataset", "Model", "Predicted Group","N", "Events", "Median Survival (days)", "Mean Survival (days)")
+  write.csv(surv_summaries, file='tables/surv_summaries.csv')
+  
+  
+  
+  
+  #cor heatmap
+  cor_heatmap_df <- df_list$train_eac[,c(clin_features, rad_features, "os_time")]
+  colnames(cor_heatmap_df) <- c("Age", "cT stage","cN stage", "Volume", "Correlation", "Contrast", "OS time")
+  cor_heatmap_df <- cor(cor_heatmap_df, method="spearman")
+  cor_heatmap_df <- melt(cor_heatmap_df)
+  cor_heatmap_plot <- ggplot(cor_heatmap_df, aes_string(fill="value", x="Var1", y="Var2"))+
+    geom_tile() +
+    scale_fill_gradient2(low="deeppink4",mid="white", high="dodgerblue3", limits=c(-1,1))+
+    xlab(element_blank())+
+    ylab(element_blank())+
+    labs(fill=expression(rho))+
+    theme(axis.text.x = element_text(angle = 30, vjust = 0.5, hjust=NULL))+
+    ggtitle("A")
+  ggsave(cor_heatmap_plot,
+         filename = "figures/cor_heatmap_plot.png",
+         width=8,
+         height=6,
+         dpi=600,
+         units = "in")
+  
+  
+  
+  
+  #plot prognostic indices
+  yhat_df <- list()
+  for(i in seq_along(mod_list)){
+    for(j in seq_along(df_list)){
+      
+      yhat_df_i <- data.frame(
+        Model=c("Clinical","ClinVol", "ClinRad")[i],
+        Dataset=c("Train", "Test")[j],
+        Prediction=predict(mod_list[[i]], df_list[[j]])
+      )
+      yhat_df[[length(yhat_df)+1]]<- yhat_df_i
+    }
+  }
+  yhat_df <- do.call(rbind, yhat_df)
+  yhat_df$Dataset <- factor(yhat_df$Dataset, levels=c("Train", "Test"))
+  
+  yhat_plot <- ggplot(yhat_df, aes(x=Prediction, fill=Dataset))+
+    geom_vline(xintercept=0, linetype=2)+
+    geom_histogram(bins=20, alpha=0.75)+
+    facet_grid(Dataset~Model, scales="free_y")+
+    xlab("Model Prediction (logit)")+
+    ylab("N")+
+    theme_bw()+
+    theme(legend.position = "None")+
+    ggtitle("B")
+  
+  ggsave(yhat_plot,
+         filename = "figures/prognostic_index_distribution_plot.png",
+         width=7,
+         height=6,
+         dpi=600,
+         units = "in")
+  
+  
+  ch_yhat_plot <- ggarrange(cor_heatmap_plot, yhat_plot)
+  ggsave(ch_yhat_plot,
+         filename = "figures/cor_hmap_and_prog_idx.png",
+         width=8.5,
+         height=6,
+         dpi=600,
+         units = "in")
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  for(i in seq_along(df_list)){
+    df_list[[i]]$yhat_clin <- predict(clin_mod, df_list[[i]])
+    df_list[[i]]$yhat_clinrad <- predict(clinrad_mod, df_list[[i]])
+  }
+  
+  all_yhats <- lapply(df_list, function(df_i){
+    df_i[,c("dataset", "yhat_clin", "yhat_clinrad")]
+  })
+  all_yhats[[1]]$dataset <- "Train"
+  all_yhats[[2]]$dataset <- "Test"
+  
+  all_yhats <- do.call(rbind, all_yhats)
+  rownames(all_yhats)<- NULL
+  all_yhats <- melt(all_yhats)
+  all_yhats$dataset <- factor( all_yhats$dataset, levels=c("Train", "Test"))
+  all_yhats$variable <- gsub("yhat_clinrad", "Clinicoradiomic",  all_yhats$variable)
+  all_yhats$variable <- gsub("yhat_clin", "Clinical",  all_yhats$variable)
+  colnames(all_yhats)[2]<- "Model"
+  
+  
+  
+  
+  
+  
+  
+  
+  
+}
+
+#radiomic stability
+if(T){
+  
+  stability_df <- stability_df[c("region", "acq_scanner_manufacturer","institution", rad_features[-1])]
+  param_grid <- expand.grid(
+    feature=rad_features[-1],
+    
+    var=c("acq_scanner_manufacturer", "institution"),
+    region=c("gtv")
+  )
+  stability_res <- lapply(1:nrow(param_grid), function(params_i){
+    
+    region_i <- param_grid$region[params_i]
+    feature_i <- param_grid$feature[params_i]
+    var_i <- param_grid$var[params_i]
+    df_i <- stability_df[stability_df$region==region_i,]
+    formula_i <- as.formula(paste0(feature_i, "~", var_i))
+    test_i <- summary(aov(formula_i,
+                          data = df_i
+    ))[[1]]
+    
+    output <- data.frame(
+      region=region_i,
+      var=var_i,
+      feature=feature_i,
+      f=test_i$`F value`[1],
+      df=test_i$Df[1],
+      p=test_i$`Pr(>F)`[1]
+    )
+    return(output)
+    
+  })
+  stability_res <- do.call(rbind.data.frame, stability_res)
+  stability_res$region <- c("tumour", "control")[factor(stability_res$region)]
+  stability_res$f <- round(stability_res$f, 2)
+  stability_res$p <- format_p(stability_res$p)
+  
+}
+
+#radiomic volume associations
+if(T){
+  
+  param_grid <- expand.grid(
+    dataset=unique(all_data$dataset),
+    feature=rad_features[-1],
+    stringsAsFactors = F
+  )
+  vol_assocs <- lapply(rad_features[-1], function(feature_i){
+    
+    test_i <- cor.test(all_data[,feature_i],
+                       all_data[,"original_shape_VoxelVolume"],
+                       method="pearson",
+                       exact=F
+    )
+    output_i <- data.frame(
+      feature=feature_i,
+      rho=test_i$estimate,
+      p=test_i$p.value
+    )
+  })
+  vol_assocs <- do.call(rbind.data.frame, vol_assocs)
+  vol_assocs$rho <- round(vol_assocs$rho, 2)
+  vol_assocs$p <- format_p(vol_assocs$p, table=T)
+  rownames(vol_assocs)<- NULL
+  write.csv(vol_assocs, "tables/vol_assocs.csv")
+  
+  #vol_confounded_features <- vol_assocs$feature[vol_assocs$p!=">.05"]
+  #rad_features <- setdiff(rad_features, vol_confounded_features)
+  
+}
+
+#partial correlation analysis
+if(T){
+  library(abind)
+  df_list$traintest_eac <- rbind(df_list$train_eac,df_list$test_eac)
+  df_i <- df_list$traintest_eac[c(clin_features, rad_features, "os_time")]
+  df_i <- as.matrix(sapply(df_i, rank))
+  bs_pcors <- lapply(1:1000, function(bs_i){
+    
+    bs_idx <- sample(nrow(df_i), replace=T)
+    ds_GL_mod <- SILGGM(df_i[bs_idx,], method="D-S_GL")
+    Pcor_traintest_i <- ds_GL_mod$partialCor
+    return(Pcor_traintest_i)
+    
+  })
+  bs_pcors <- abind(bs_pcors, along=3)
+  bs_pcors_m <- round(apply(bs_pcors, c(1,2), mean),2)
+  bs_pcors_lo <- round(apply(bs_pcors, c(1,2), function(i) quantile(i, probs = 0.025)),2)
+  bs_pcors_hi <- round(apply(bs_pcors, c(1,2), function(i) quantile(i, probs = 0.975)),2)
+  bs_pcors <- bs_pcors[,,1]
+  bs_pcors[] <- paste0(bs_pcors_m, " [", bs_pcors_lo, ",", bs_pcors_hi, "]")
+  
+  dimnames(bs_pcors) <- rep(list(
+    c("Age", "cT stage", "cN stage",
+      "Volume", "GLCM Correlation",
+      "GLCM Contrast", "OS Time")
+  ), 2)
+  write.csv(bs_pcors, "tables/pcor_traintest2.csv")
+  
+  
+}
+
+#supplementary centre-wise model validation
+if(T){
+  
+  df_list$traintest_eac <- rbind(df_list$train_eac,df_list$test_eac)
+  df_list$traintest_eac$os_3yr_neg <- 1-df_list$traintest_eac$os_3yr
+  n_train <- nrow(df_list$train_eac)
+  
+  cv_scores <- list()
+  for(test_centre_i in c("#", "#", "#", "#", "#")){
+    
+    cv_train_df <- df_list$traintest_eac[df_list$traintest_eac$centre!=test_centre_i,]
+    cv_test_df <- df_list$traintest_eac[df_list$traintest_eac$centre==test_centre_i,]
+    
+    cv_mod_list <- lapply(formula_list, function(formula_i){
+      eval(bquote(
+        glm(.(formula_i),
+            data =  df_list$traintest_eac[df_list$traintest_eac$centre!=test_centre_i,],
+            family='binomial',
+            x=T)
+      ))
+    })
+    cv_test_df_list <- list(Train=cv_train_df, Test=cv_test_df)
+    
+    cv_scores_i <- lapply(names(cv_test_df_list), function(cv_dataset_i){
+      #overall performance analysis
+      rr_cv_i <-  riskRegression::Score(
+        cv_mod_list,
+        formula = Surv(os_time, os_event) ~ 1,
+        data = cv_test_df_list[[cv_dataset_i]],
+        conf.int = F,
+        time=comparison_time)
+      
+      auc_cv_i <- as.data.frame(rr_cv_i$AUC$score)
+      auc_cv_i$metric <- "AUC"
+      colnames(auc_cv_i)[3] <- "value"
+      brier_cv_i <- as.data.frame(rr_cv_i$Brier$score[-1,])
+      brier_cv_i$metric <- "Brier" 
+      colnames(brier_cv_i)[3] <- "value"
+      cv_scores_i <- rbind(auc_cv_i, brier_cv_i)
+      cv_scores_i$Dataset <- cv_dataset_i
+      return(cv_scores_i)
+    })
+    cv_scores_i <- do.call(rbind, cv_scores_i)
+    
+    
+    cv_scores[[length(cv_scores)+1]] <- cv_scores_i[,-2]
+    
+  }
+  cv_scores <- do.call(rbind, cv_scores)
+  
+  
+  cv_scores_df <- aggregate(cv_scores$value, by=cv_scores[,c(1,3, 4)], FUN=function(x){
+    
+    m <- round(mean(x), 2)
+    s <- round(sd(x), 2)
+    out <- paste0("m=", m,",s=", s)
+    return(out)
+  })
+  cv_scores_df_train <- cv_scores_df[cv_scores_df$Dataset=="Train",]
+  cv_scores_df_test <- cv_scores_df[cv_scores_df$Dataset=="Test",]
+  cv_scores_df <- data.frame(
+    Dataset=rep(c("Train", "Test"), each=4),
+    Model=c(cv_scores_df_train$model[1:4],cv_scores_df_test$model[1:4]),
+    
+    AUC=c(cv_scores_df_train$x[1:4],cv_scores_df_test$x[1:4]),
+    Brier=c(cv_scores_df_train$x[5:8],cv_scores_df_test$x[5:8])
+    
+  )
+  
+  write.csv(cv_scores_df, "tables/cv_scores_df.csv")
+}
+
+#save image
+if(F){
+  save.image("data_image_20_11_22.RData")
+}
+
+write.csv(df_list$traintest_eac[c("patient_id",
+                                  c(clin_features, rad_features, "os_time"))],
+          file = "tables/df_info.csv",
+          row.names = F
+)
+
+
+
+
+
+
